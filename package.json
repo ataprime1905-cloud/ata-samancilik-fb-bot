@@ -1,16 +1,15 @@
 {
   "name": "ata-samancilik-comment-manager",
   "version": "0.1.0",
-  "description": "Ata Samancılık için Facebook yorum otomasyonu — Meta Webhook + Kural Motoru + Sınırlı LLM + Human Review",
+  "description": "Ata Samancılık için Facebook yorum otomasyonu",
   "private": true,
   "engines": {
     "node": ">=20.0.0"
   },
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "prisma generate && tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "postinstall": "npm run build",
     "dev": "tsx watch src/index.ts",
     "worker": "tsx src/interfaces/workers/comment.worker.ts",
     "test": "vitest run",
@@ -32,6 +31,7 @@
     "ioredis": "^5.4.1",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
+    "prisma": "^5.22.0",
     "typescript": "^5.7.2",
     "zod": "^3.23.8"
   },
@@ -39,9 +39,7 @@
     "@types/node": "^22.10.0",
     "@vitest/coverage-v8": "^2.1.8",
     "prettier": "^3.4.2",
-    "prisma": "^5.22.0",
     "tsx": "^4.19.2",
-   
     "vitest": "^2.1.8"
   }
 }
