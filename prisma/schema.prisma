@@ -1,0 +1,278 @@
+// ============================================================
+// Ata Samancılık Comment Manager — Prisma Schema
+// ============================================================
+// Tasarım notları:
+// - Multi-product mimari: MVP'de Dörtlü Kaba Yem aktif olsa da
+//   gelecekte saman/yonca/arpa eklenebilir. Fiyat ürün bazlıdır.
+// - PII minimizasyonu: author_platform_id_hash kullanıyoruz,
+//   ham ID saklanmaz. profil adı opsiyonel; gerekiyorsa silinir.
+// - Idempotency: comments tablosunda (platform, comment_id) unique.
+// - Audit: tüm admin aksiyonları audit_log'a yazılır.
+// - Retention: conversation_state TTL ile expire olur.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// PRODUCTS
+// ============================================================
+model Product {
+  id                 String   @id @default(uuid())
+  sku                String   @unique
+  name               String
+  isActive           Boolean  @default(true) @map("is_active")
+  unit               String   @default("ton") // "ton" | "kg" | "package"
+  shippingMode       String   @default("tir") // "tir" | "package" | "mixed"
+  minTonnageDefault  Int      @default(25) @map("min_tonnage_default")
+  notes              String?
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  attributes ProductAttribute?
+  cityPrices CityPrice[]
+
+  @@map("products")
+}
+
+model ProductAttribute {
+  id              String   @id @default(uuid())
+  productId       String   @unique @map("product_id")
+  // composition_json örn: {"Mısır Silajı": 50, "Sorgum Otu": 20, ...}
+  compositionJson Json     @map("composition_json")
+  protein         Float?
+  dryMatter       Float?   @map("dry_matter")
+  energyMin       Int?     @map("energy_min")
+  energyMax       Int?     @map("energy_max")
+  packWeightKg    Float?   @map("pack_weight_kg")
+  isVacuumPressed Boolean  @default(false) @map("is_vacuum_pressed")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("product_attributes")
+}
+
+// ============================================================
+// CITY PRICES
+// ============================================================
+model CityPrice {
+  id                  String    @id @default(uuid())
+  productId           String    @map("product_id")
+  cityName            String    @map("city_name")     // Canonical: "Şanlıurfa"
+  citySlug            String    @map("city_slug")     // ASCII slug: "sanliurfa"
+  priceTryPerTon      Int       @map("price_try_per_ton") // TL/ton, integer
+  transportIncluded   Boolean   @default(true) @map("transport_included")
+  minTonnageOverride  Int?      @map("min_tonnage_override")
+  validFrom           DateTime  @default(now()) @map("valid_from")
+  validTo             DateTime? @map("valid_to")
+  isActive            Boolean   @default(true) @map("is_active")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // Bir ürün için bir ilin tek aktif fiyatı olmalı
+  @@unique([productId, citySlug, validFrom])
+  @@index([citySlug, isActive])
+  @@map("city_prices")
+}
+
+// ============================================================
+// REPLY RULES (deterministic templates)
+// ============================================================
+model ReplyRule {
+  id                  String   @id @default(uuid())
+  intent              String   @unique  // "ask_price_generic", etc.
+  triggerPatternsJson Json     @map("trigger_patterns_json") // string[] regex/keywords
+  replyTemplate       String   @map("reply_template")
+  requiresCity        Boolean  @default(false) @map("requires_city")
+  requiresProduct     Boolean  @default(false) @map("requires_product")
+  fixedPriceOnly      Boolean  @default(false) @map("fixed_price_only")
+  humanFallback       Boolean  @default(false) @map("human_fallback")
+  isActive            Boolean  @default(true) @map("is_active")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@map("reply_rules")
+}
+
+// ============================================================
+// COMMENTS (raw event)
+// ============================================================
+model Comment {
+  id                    String   @id @default(uuid())
+  platform              String   // "facebook" | "instagram"
+  commentId             String   @map("comment_id")           // Meta'nın verdiği id
+  parentCommentId       String?  @map("parent_comment_id")
+  postId                String?  @map("post_id")
+  pageOrIgId            String?  @map("page_or_ig_id")
+  // PII MINIMIZASYONU: ham platform id yerine HASH saklıyoruz
+  authorPlatformIdHash  String   @map("author_platform_id_hash")
+  authorNameOptional    String?  @map("author_name_optional")
+  commentText           String   @map("comment_text")
+  commentPermalink      String?  @map("comment_permalink")
+  createdTimePlatform   DateTime? @map("created_time_platform")
+  receivedAt            DateTime @default(now()) @map("received_at")
+  // raw payload sadece debug için, retention policy ile silinir
+  rawPayloadJsonOptional Json?   @map("raw_payload_json_optional")
+
+  processing      CommentProcessing?
+  humanReview     HumanReviewQueue?
+  replyAttempts   ReplyAttempt[]
+
+  // Idempotency: aynı yorumun iki kez işlenmesini engeller
+  @@unique([platform, commentId])
+  @@index([authorPlatformIdHash, receivedAt])
+  @@index([receivedAt])
+  @@map("comments")
+}
+
+// ============================================================
+// COMMENT PROCESSING (decision result)
+// ============================================================
+model CommentProcessing {
+  id                String   @id @default(uuid())
+  commentId         String   @unique @map("comment_id")
+  normalizedText    String   @map("normalized_text")
+  normalizedCity    String?  @map("normalized_city")    // canonical city name
+  detectedProductId String?  @map("detected_product_id")
+  intent            String
+  confidence        Float    @default(0.0)
+  // decision: "auto_reply" | "human_review" | "ignore"
+  decision          String
+  shouldReply       Boolean  @default(false) @map("should_reply")
+  needsHuman        Boolean  @default(false) @map("needs_human")
+  humanReason       String?  @map("human_reason")
+  replyText         String?  @map("reply_text")
+  // reply_status: "pending" | "sent" | "failed" | "skipped"
+  replyStatus       String   @default("pending") @map("reply_status")
+  metaReplyId       String?  @map("meta_reply_id")
+  errorCode         String?  @map("error_code")
+  errorMessage      String?  @map("error_message")
+  processedAt       DateTime @default(now()) @map("processed_at")
+  handledAt         DateTime? @map("handled_at")
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@index([decision])
+  @@index([intent])
+  @@map("comment_processing")
+}
+
+// ============================================================
+// CONVERSATION STATE (short-lived context)
+// ============================================================
+model ConversationState {
+  id                    String   @id @default(uuid())
+  platform              String
+  authorPlatformIdHash  String   @map("author_platform_id_hash")
+  lastCity              String?  @map("last_city")
+  lastProductId         String?  @map("last_product_id")
+  lastIntent            String?  @map("last_intent")
+  lastCommentId         String?  @map("last_comment_id")
+  stateExpiresAt        DateTime @map("state_expires_at")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@unique([platform, authorPlatformIdHash])
+  @@index([stateExpiresAt])
+  @@map("conversation_state")
+}
+
+// ============================================================
+// AUDIT LOG
+// ============================================================
+model AuditLog {
+  id          String   @id @default(uuid())
+  eventType   String   @map("event_type")
+  entityType  String?  @map("entity_type")
+  entityId    String?  @map("entity_id")
+  payloadHash String?  @map("payload_hash")
+  operator    String?  // admin user id / "system" / "worker"
+  source      String?  // "webhook" | "admin_api" | "worker" | "cli"
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([eventType, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_log")
+}
+
+// ============================================================
+// INTEGRATION ACCOUNTS (page/ig token storage)
+// ============================================================
+model IntegrationAccount {
+  id                    String   @id @default(uuid())
+  platform              String   // "facebook" | "instagram"
+  pageId                String   @map("page_id")
+  pageName              String?  @map("page_name")
+  // Üretimde mutlaka encrypted; MVP'de placeholder
+  accessTokenEncrypted  String   @map("access_token_encrypted")
+  tokenStatus           String   @default("active") @map("token_status") // active|expired|revoked
+  scopesJson            Json     @map("scopes_json")
+  connectedBy           String?  @map("connected_by")
+  connectedAt           DateTime @default(now()) @map("connected_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@unique([platform, pageId])
+  @@map("integration_accounts")
+}
+
+// ============================================================
+// SYSTEM SETTINGS (key-value config)
+// ============================================================
+model SystemSetting {
+  key       String   @id
+  valueJson Json     @map("value_json")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
+
+// ============================================================
+// HUMAN REVIEW QUEUE
+// ============================================================
+model HumanReviewQueue {
+  id              String    @id @default(uuid())
+  commentId       String    @unique @map("comment_id")
+  reason          String
+  suggestedReply  String?   @map("suggested_reply")
+  // status: "pending" | "approved" | "rejected" | "edited_and_sent"
+  status          String    @default("pending")
+  assignedTo      String?   @map("assigned_to")
+  resolvedBy      String?   @map("resolved_by")
+  resolvedAt      DateTime? @map("resolved_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@map("human_review_queue")
+}
+
+// ============================================================
+// REPLY ATTEMPTS (retry tracking)
+// ============================================================
+model ReplyAttempt {
+  id              String   @id @default(uuid())
+  commentId       String   @map("comment_id")
+  replyText       String   @map("reply_text")
+  attemptNo       Int      @map("attempt_no")
+  // status: "success" | "rate_limited" | "token_invalid" | "transient_error" | "permanent_error"
+  status          String
+  metaResponseJson Json?   @map("meta_response_json")
+  errorCode       String?  @map("error_code")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@index([commentId, attemptNo])
+  @@map("reply_attempts")
+}
